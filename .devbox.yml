@@ -1,0 +1,29 @@
+# .devbox.yml - Drop this file in the root of any repo to customize DevBox behavior.
+# If absent, DevBox still works with no custom setup.
+
+# Shell command to run after clone + branch checkout.
+# Use this to install dependencies, build toolchains, etc.
+setup: |
+  echo "Setting up..."
+  # pip install -r requirements.txt
+  # npm install
+  # make bootstrap
+
+# Shell command that runs when ./devbox.sh up --headless or hv test is called.
+# Exit 0 = success, non-zero = failure (triggers on_failure handler).
+test: |
+  echo "Running tests..."
+  # pytest tests/ -v
+  # npm test
+  # make test
+
+# Secrets Manager secret names to inject as environment variables.
+# Each secret must be a JSON object of key=value pairs.
+secrets: []
+  # - machpit/my-service-credentials
+
+# Default branch to target for PRs.
+base_branch: main
+
+# Auto-nuke the worker after tests pass? Set false to keep alive for inspection.
+auto_nuke_on_success: true
