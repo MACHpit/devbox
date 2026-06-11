@@ -9,13 +9,14 @@ Parameters:
     Default: t3.medium
   KeyPairName:
     Type: String
-    Default: arenaproof
+    Default: machpit-devbox
   SubnetId:
     Type: String
   VpcId:
     Type: String
   S3Bucket:
     Type: String
+    Default: machpit-devbox
   JobS3Key:
     Type: String
   IdleMinutes:
@@ -43,7 +44,7 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
       Policies:
-        - PolicyName: devbox-worker-policy
+        - PolicyName: machpit-devbox-worker-policy
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -74,7 +75,7 @@ Resources:
   DevBoxSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: DevBox worker SSH access
+      GroupDescription: MACHpit DevBox worker SSH access
       VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -98,7 +99,7 @@ Resources:
       Tags:
         - Key: Name
           Value: !Ref StackName
-        - Key: devbox
+        - Key: machpit-devbox
           Value: "true"
       UserData:
         Fn::Base64: !Sub |
@@ -107,14 +108,15 @@ Resources:
           LOG=/var/log/devbox-bootstrap.log
           exec > >(tee -a $LOG) 2>&1
 
-          echo "=== DevBox Bootstrap ==="
+          echo "=== MACHpit DevBox Bootstrap ==="
           echo "Stack: ${StackName}"
           echo "Job:   ${JobS3Key}"
           date
 
           # ── System packages ────────────────────────────────────────────────
           dnf update -y --quiet
-          dnf install -y git python3 python3-pip jq unzip --quiet
+          dnf install -y git python3 python3-pip jq unzip at --quiet
+          pip3 install pyyaml --quiet
 
           # ── AWS CLI v2 ─────────────────────────────────────────────────────
           curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
@@ -126,11 +128,11 @@ Resources:
           dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
           dnf install -y gh --quiet
 
-          # ── hv helper ─────────────────────────────────────────────────────
-          aws s3 cp s3://${S3Bucket}/devbox/hv /usr/local/bin/hv
-          chmod +x /usr/local/bin/hv
+          # ── mach helper ───────────────────────────────────────────────────
+          aws s3 cp s3://${S3Bucket}/devbox/mach /usr/local/bin/mach
+          chmod +x /usr/local/bin/mach
 
-          # ── Fetch GitHub PAT from Secrets Manager ─────────────────────────
+          # ── Fetch GitHub PAT ──────────────────────────────────────────────
           GITHUB_PAT=$(aws secretsmanager get-secret-value \
             --secret-id ${GithubPatSecret} \
             --region ${AWS::Region} \
@@ -143,14 +145,22 @@ Resources:
           git config --global user.name "MACHpit DevBox"
 
           # ── Fetch job definition ───────────────────────────────────────────
+          mkdir -p /opt/devbox
           aws s3 cp s3://${S3Bucket}/${JobS3Key} /opt/devbox/job.json
-          REPO=$(jq -r '.repo'     /opt/devbox/job.json)
-          BRANCH=$(jq -r '.branch' /opt/devbox/job.json)
-          TASK=$(jq -r '.task'     /opt/devbox/job.json)
+
+          REPO=$(jq -r '.repo'      /opt/devbox/job.json)
+          BRANCH=$(jq -r '.branch'  /opt/devbox/job.json)
+          TASK=$(jq -r '.task'      /opt/devbox/job.json)
           TEST_CMD=$(jq -r '.test_cmd // ""' /opt/devbox/job.json)
           ON_SUCCESS=$(jq -r '.on_success // "pr"' /opt/devbox/job.json)
 
           echo "repo=$REPO  branch=$BRANCH  task=$TASK"
+
+          # Export for mach helper
+          echo "export STACK_NAME=${StackName}"    >> /etc/profile.d/devbox.sh
+          echo "export DEVBOX_S3_BUCKET=${S3Bucket}" >> /etc/profile.d/devbox.sh
+          echo "export AWS_REGION=${AWS::Region}"  >> /etc/profile.d/devbox.sh
+          echo "export MACH_REPO_DIR=/opt/devbox/workspace/repo" >> /etc/profile.d/devbox.sh
 
           # ── Clone repo ─────────────────────────────────────────────────────
           mkdir -p /opt/devbox/workspace
@@ -170,30 +180,29 @@ Resources:
           if [ -f .devbox.yml ]; then
             echo "Loading .devbox.yml"
             SETUP_CMD=$(python3 -c "
-          import yaml, sys
-          d = yaml.safe_load(open('.devbox.yml'))
-          print(d.get('setup',''))
-          " 2>/dev/null || echo "")
+import yaml
+d = yaml.safe_load(open('.devbox.yml'))
+print(d.get('setup',''))
+" 2>/dev/null || echo "")
             TEST_CMD_OVERRIDE=$(python3 -c "
-          import yaml, sys
-          d = yaml.safe_load(open('.devbox.yml'))
-          print(d.get('test',''))
-          " 2>/dev/null || echo "")
-            [ -n "$SETUP_CMD" ]       && eval "$SETUP_CMD"
-            [ -n "$TEST_CMD_OVERRIDE" ] && TEST_CMD="$TEST_CMD_OVERRIDE"
+import yaml
+d = yaml.safe_load(open('.devbox.yml'))
+print(d.get('test',''))
+" 2>/dev/null || echo "")
+            [ -n "$SETUP_CMD" ]          && eval "$SETUP_CMD"
+            [ -n "$TEST_CMD_OVERRIDE" ]  && TEST_CMD="$TEST_CMD_OVERRIDE"
 
-            # Pull env vars from Secrets Manager if declared
             python3 -c "
-          import yaml, subprocess, os, json
-          d = yaml.safe_load(open('.devbox.yml'))
-          for secret_name in d.get('secrets', []):
-              r = subprocess.run(['aws','secretsmanager','get-secret-value',
-                  '--secret-id', secret_name, '--query','SecretString','--output','text'],
-                  capture_output=True, text=True)
-              for k, v in json.loads(r.stdout.strip()).items():
-                  with open('/etc/environment','a') as f:
-                      f.write(f'{k}={v}\n')
-          " 2>/dev/null || true
+import yaml, subprocess, json
+d = yaml.safe_load(open('.devbox.yml'))
+for secret_name in d.get('secrets', []):
+    r = subprocess.run(['aws','secretsmanager','get-secret-value',
+        '--secret-id', secret_name, '--query','SecretString','--output','text'],
+        capture_output=True, text=True)
+    for k, v in json.loads(r.stdout.strip()).items():
+        with open('/etc/environment','a') as f:
+            f.write(f'{k}={v}\n')
+" 2>/dev/null || true
           fi
 
           # ── Run tests if headless ──────────────────────────────────────────
@@ -203,26 +212,25 @@ Resources:
             eval "$TEST_CMD" || EXIT_CODE=$?
           fi
 
-          # ── Report result to S3 ────────────────────────────────────────────
+          # ── Report result ──────────────────────────────────────────────────
           STATUS="success"
           [ $EXIT_CODE -ne 0 ] && STATUS="failed"
 
           python3 -c "
-          import json, datetime
-          result = {
-              'stack': '${StackName}',
-              'repo': '$REPO',
-              'branch': '$BRANCH',
-              'status': '$STATUS',
-              'exit_code': $EXIT_CODE,
-              'timestamp': datetime.datetime.utcnow().isoformat()
-          }
-          print(json.dumps(result, indent=2))
-          " > /opt/devbox/result.json
+import json, datetime
+result = {
+    'stack':     '${StackName}',
+    'repo':      '$REPO',
+    'branch':    '$BRANCH',
+    'status':    '$STATUS',
+    'exit_code': $EXIT_CODE,
+    'timestamp': datetime.datetime.utcnow().isoformat()
+}
+print(json.dumps(result, indent=2))
+" > /opt/devbox/result.json
 
           aws s3 cp /opt/devbox/result.json \
             s3://${S3Bucket}/devbox/results/${StackName}.json
-
           aws s3 cp $LOG \
             s3://${S3Bucket}/devbox/logs/${StackName}/bootstrap.log
 
@@ -235,17 +243,17 @@ Resources:
               git push origin "$BRANCH"
               gh pr create \
                 --title "devbox: $BRANCH" \
-                --body "Automated PR from DevBox worker \`${StackName}\`." \
-                --base main \
-                || true
+                --body "Automated PR from MACHpit DevBox worker \`${StackName}\`." \
+                --base main || true
             fi
           fi
 
-          # ── Idle or interactive mode ───────────────────────────────────────
+          # ── Idle shutdown or interactive stay-alive ────────────────────────
           if [ "$TASK" = "interactive" ]; then
-            echo "=== Interactive mode - worker staying alive ==="
-            # Idle shutdown still applies
-            echo "shutdown -h +${IdleMinutes} 'DevBox idle timeout'" | at now
+            echo "=== Interactive mode - worker alive for ${IdleMinutes} minutes ==="
+            systemctl start atd || true
+            echo "aws cloudformation delete-stack --stack-name ${StackName} --region ${AWS::Region}" \
+              | at "now + ${IdleMinutes} minutes" 2>/dev/null || true
           else
             echo "=== Headless task complete - self-destructing ==="
             aws cloudformation delete-stack \
