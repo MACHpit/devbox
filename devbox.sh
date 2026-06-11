@@ -25,15 +25,14 @@ import re
 # ── Config ────────────────────────────────────────────────────────────────────
 REGION          = os.environ.get("AWS_REGION", "us-east-1")
 STACK_PREFIX    = "devbox"
-S3_BUCKET       = os.environ.get("DEVBOX_S3_BUCKET", "hackerverse-agents")
+S3_BUCKET       = os.environ.get("DEVBOX_S3_BUCKET", "machpit-devbox")
 S3_PREFIX       = "devbox"
 SECRETS_PAT     = os.environ.get("DEVBOX_PAT_SECRET", "machpit/github-pat")
-SECRETS_AWS_KEY = os.environ.get("DEVBOX_AWS_SECRET", "machpit/aws-credentials")
-DEFAULT_AMI     = os.environ.get("DEVBOX_AMI", "")          # auto-resolved if blank
+DEFAULT_AMI     = os.environ.get("DEVBOX_AMI", "")
 DEFAULT_ITYPE   = "t3.medium"
-KEYPAIR         = os.environ.get("DEVBOX_KEYPAIR", "arenaproof")
-SUBNET_ID       = os.environ.get("DEVBOX_SUBNET", "subnet-0dfe246d22601a8c6")
-VPC_ID          = os.environ.get("DEVBOX_VPC", "vpc-004bb96ecf38ae270")
+KEYPAIR         = os.environ.get("DEVBOX_KEYPAIR", "machpit-devbox")
+SUBNET_ID       = os.environ.get("DEVBOX_SUBNET", "")
+VPC_ID          = os.environ.get("DEVBOX_VPC", "")
 IDLE_TIMEOUT    = int(os.environ.get("DEVBOX_IDLE_MINUTES", "120"))
 CF_TEMPLATE_URL = os.environ.get(
     "DEVBOX_CF_TEMPLATE",
@@ -50,20 +49,11 @@ def ts() -> str:
 def stack_name(repo: str) -> str:
     return f"{STACK_PREFIX}-{slug(repo)}-{ts()}"
 
-def cf_client():
-    return boto3.client("cloudformation", region_name=REGION)
-
-def ssm_client():
-    return boto3.client("ssm", region_name=REGION)
-
-def ec2_client():
-    return boto3.client("ec2", region_name=REGION)
-
-def s3_client():
-    return boto3.client("s3", region_name=REGION)
-
-def sm_client():
-    return boto3.client("secretsmanager", region_name=REGION)
+def cf_client():  return boto3.client("cloudformation", region_name=REGION)
+def ssm_client(): return boto3.client("ssm",            region_name=REGION)
+def ec2_client(): return boto3.client("ec2",            region_name=REGION)
+def s3_client():  return boto3.client("s3",             region_name=REGION)
+def sm_client():  return boto3.client("secretsmanager", region_name=REGION)
 
 def list_devbox_stacks():
     cf = cf_client()
@@ -86,14 +76,13 @@ def get_stack_output(stack_name, key):
     return None
 
 def resolve_ami():
-    """Latest Amazon Linux 2023 x86_64 in region."""
     ec2 = ec2_client()
     r = ec2.describe_images(
         Owners=["amazon"],
         Filters=[
-            {"Name": "name",           "Values": ["al2023-ami-*-x86_64"]},
-            {"Name": "state",          "Values": ["available"]},
-            {"Name": "architecture",   "Values": ["x86_64"]},
+            {"Name": "name",        "Values": ["al2023-ami-*-x86_64"]},
+            {"Name": "state",       "Values": ["available"]},
+            {"Name": "architecture","Values": ["x86_64"]},
         ]
     )
     images = sorted(r["Images"], key=lambda x: x["CreationDate"], reverse=True)
@@ -102,14 +91,18 @@ def resolve_ami():
     return images[0]["ImageId"]
 
 def upload_cf_template():
-    """Upload the CloudFormation template to S3 so CF can reference it."""
-    template_path = os.path.join(os.path.dirname(__file__), "devbox-worker.yaml")
+    template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "devbox-worker.yaml")
+    mach_path     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mach")
     if not os.path.exists(template_path):
         sys.exit(f"ERROR: devbox-worker.yaml not found at {template_path}")
-    s3 = s3_client()
+    s3  = s3_client()
     key = f"{S3_PREFIX}/devbox-worker.yaml"
     s3.upload_file(template_path, S3_BUCKET, key)
-    print(f"  Uploaded CF template -> s3://{S3_BUCKET}/{key}")
+    print(f"  Uploaded CF template  -> s3://{S3_BUCKET}/{key}")
+    if os.path.exists(mach_path):
+        mach_key = f"{S3_PREFIX}/mach"
+        s3.upload_file(mach_path, S3_BUCKET, mach_key)
+        print(f"  Uploaded mach helper  -> s3://{S3_BUCKET}/{mach_key}")
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 def cmd_up(args):
@@ -120,37 +113,37 @@ def cmd_up(args):
     ami         = DEFAULT_AMI or resolve_ami()
     name        = stack_name(repo)
 
+    if not SUBNET_ID or not VPC_ID:
+        sys.exit("ERROR: Set DEVBOX_SUBNET and DEVBOX_VPC environment variables first.\n"
+                 "  Run: ./devbox.sh bootstrap-vpc  (after AWS account is ready)")
+
     print(f"[devbox] Spinning up worker: {name}")
     print(f"  repo={repo}  branch={branch}  ami={ami}  type={itype}")
 
     upload_cf_template()
 
     job = {
-        "repo":        repo,
-        "branch":      branch,
-        "task":        "interactive" if interactive else "headless",
-        "test_cmd":    "",
-        "on_success":  "pr",
-        "on_failure":  "report"
+        "repo":       repo,
+        "branch":     branch,
+        "task":       "interactive" if interactive else "headless",
+        "test_cmd":   "",
+        "on_success": "pr",
+        "on_failure": "report"
     }
     job_key = f"{S3_PREFIX}/jobs/{name}.json"
-    s3_client().put_object(
-        Bucket=S3_BUCKET,
-        Key=job_key,
-        Body=json.dumps(job).encode()
-    )
+    s3_client().put_object(Bucket=S3_BUCKET, Key=job_key, Body=json.dumps(job).encode())
 
     params = [
-        {"ParameterKey": "AmiId",         "ParameterValue": ami},
-        {"ParameterKey": "InstanceType",  "ParameterValue": itype},
-        {"ParameterKey": "KeyPairName",   "ParameterValue": KEYPAIR},
-        {"ParameterKey": "SubnetId",      "ParameterValue": SUBNET_ID},
-        {"ParameterKey": "VpcId",         "ParameterValue": VPC_ID},
-        {"ParameterKey": "S3Bucket",      "ParameterValue": S3_BUCKET},
-        {"ParameterKey": "JobS3Key",      "ParameterValue": job_key},
-        {"ParameterKey": "IdleMinutes",   "ParameterValue": str(IDLE_TIMEOUT)},
+        {"ParameterKey": "AmiId",           "ParameterValue": ami},
+        {"ParameterKey": "InstanceType",    "ParameterValue": itype},
+        {"ParameterKey": "KeyPairName",     "ParameterValue": KEYPAIR},
+        {"ParameterKey": "SubnetId",        "ParameterValue": SUBNET_ID},
+        {"ParameterKey": "VpcId",           "ParameterValue": VPC_ID},
+        {"ParameterKey": "S3Bucket",        "ParameterValue": S3_BUCKET},
+        {"ParameterKey": "JobS3Key",        "ParameterValue": job_key},
+        {"ParameterKey": "IdleMinutes",     "ParameterValue": str(IDLE_TIMEOUT)},
         {"ParameterKey": "GithubPatSecret", "ParameterValue": SECRETS_PAT},
-        {"ParameterKey": "StackName",     "ParameterValue": name},
+        {"ParameterKey": "StackName",       "ParameterValue": name},
     ]
 
     cf = cf_client()
@@ -160,9 +153,9 @@ def cmd_up(args):
         Parameters=params,
         Capabilities=["CAPABILITY_IAM"],
         Tags=[
-            {"Key": "devbox",   "Value": "true"},
-            {"Key": "repo",     "Value": repo},
-            {"Key": "branch",   "Value": branch},
+            {"Key": "devbox", "Value": "true"},
+            {"Key": "repo",   "Value": repo},
+            {"Key": "branch", "Value": branch},
         ]
     )
 
@@ -199,7 +192,6 @@ def cmd_up(args):
 
 
 def cmd_dispatch(args):
-    """Fire a job from a JSON string or S3 key."""
     job_input = args.job
     if job_input.startswith("s3://") or not job_input.startswith("{"):
         job_key = job_input.replace(f"s3://{S3_BUCKET}/", "")
@@ -208,17 +200,13 @@ def cmd_dispatch(args):
     else:
         job = json.loads(job_input)
 
-    repo   = job.get("repo", "unknown/repo")
-    branch = job.get("branch", f"devbox/{ts()}")
-
-    # Re-use cmd_up logic with a synthetic args object
     class FakeArgs:
         pass
-    fa = FakeArgs()
-    fa.repo        = repo
-    fa.branch      = branch
+    fa            = FakeArgs()
+    fa.repo       = job.get("repo", "unknown/repo")
+    fa.branch     = job.get("branch", f"devbox/{ts()}")
     fa.interactive = False
-    fa.instance    = job.get("instance_type", DEFAULT_ITYPE)
+    fa.instance   = job.get("instance_type", DEFAULT_ITYPE)
     cmd_up(fa)
 
 
@@ -234,15 +222,12 @@ def cmd_status(args):
 
 
 def cmd_logs(args):
-    worker_id = args.worker_id
-    ssm = ssm_client()
-    # Fetch latest log from S3
-    key = f"{S3_PREFIX}/logs/{worker_id}/bootstrap.log"
+    key = f"{S3_PREFIX}/logs/{args.worker_id}/bootstrap.log"
     try:
         r = s3_client().get_object(Bucket=S3_BUCKET, Key=key)
         print(r["Body"].read().decode())
     except Exception:
-        print(f"No logs yet for {worker_id}. Worker may still be booting.")
+        print(f"No logs yet for {args.worker_id}. Worker may still be booting.")
 
 
 def cmd_nuke(args):
@@ -263,9 +248,8 @@ def cmd_nuke(args):
 
 
 def cmd_init_secrets(args):
-    """One-time setup: store GitHub PAT in Secrets Manager."""
     import getpass
-    sm = sm_client()
+    sm  = sm_client()
     pat = getpass.getpass("GitHub PAT: ").strip()
     try:
         sm.create_secret(Name=SECRETS_PAT, SecretString=pat)
